@@ -160,4 +160,176 @@ def encode_contexts(text_list):
 # you would now encode these paragraphs to create embeddings.
 context_embeddings = encode_contexts(paragraphs)
 
+#CREATE AND POPULATE THE FACEBOOK AI SIMILARITY SEARCH INDEX
+import faiss
 
+# Convert list of numpy arrays into a single numpy array
+embedding_dim = 768  # This should match the dimension of your embeddings
+embeddings_np = np.array(embeddings).astype('float32')
+
+# Create a FAISS index for the embeddings
+index = faiss.IndexFlatL2(embedding_dim)
+index.add(embeddings_np)  # Add the context embeddings to the index
+
+#DENSE PASSAGE RETRIEVER ENCODER AND TOKENIZER
+# Load DPR question encoder and tokenizer
+question_encoder = DPRQuestionEncoder.from_pretrained('facebook/dpr-question_encoder-single-nq-base')
+question_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained('facebook/dpr-question_encoder-single-nq-base')
+
+#Example query and context retrieval
+# Example question
+question = 'Drug and Alcohol Policy'
+question_inputs = question_tokenizer(question, return_tensors='pt')
+question_embedding = question_encoder(**question_inputs).pooler_output.detach().numpy()
+
+# Search the index
+D, I = index.search(question_embedding, k=5)  # Retrieve top 5 relevant contexts
+print("D:",D)
+print("I:",I)
+
+print("Top 5 relevant contexts:")
+for i, idx in enumerate(I[0]):
+    print(f"{i+1}: {paragraphs[idx]}")
+    print(f"distance {D[0][i]}\n")
+
+#Convert the above to a function
+def search_relevant_contexts(question, question_tokenizer, question_encoder, index, k=5):
+    """
+    Searches for the most relevant contexts to a given question.
+
+    Returns:
+    tuple: Distances and indices of the top k relevant contexts.
+    """
+    # Tokenize the question
+    question_inputs = question_tokenizer(question, return_tensors='pt')
+
+    # Encode the question to get the embedding
+    question_embedding = question_encoder(**question_inputs).pooler_output.detach().numpy()
+
+    # Search the index to retrieve top k relevant contexts
+    D, I = index.search(question_embedding, k)
+
+    return D, I
+
+#Enhancing response generation with LLMs
+tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+#Input text
+contexts= "What is a large language model?"
+
+#Tokenize the input text to prepare it for the model:
+inputs = tokenizer(contexts, return_tensors='pt', max_length=1024, truncation=True)
+print(inputs)
+
+#Utilize the LLM to generate text, ensuring that the output is in token indexes:
+summary_ids = model.generate(inputs['input_ids'], max_length=50, num_beams=4, early_stopping=True,
+                             pad_token_id=tokenizer.eos_token_id)
+summary_ids
+
+#Decode the generated token indexes back to text:
+summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+print(summary)
+
+#Comparing answer generation: With and without DPR contexts
+#Generating answers directly from questions
+#First, let's look at how the GPT2 model generates answers without any additional context:
+
+def generate_answer_without_context(question):
+    # Tokenize the input question
+    inputs = tokenizer(question, return_tensors='pt', max_length=1024, truncation=True)
+    
+    # Generate output directly from the question without additional context
+    summary_ids = model.generate(inputs['input_ids'], max_length=150, min_length=40, length_penalty=2.0,
+                                 num_beams=4, early_stopping=True,pad_token_id=tokenizer.eos_token_id)
+    
+    # Decode and return the generated text
+    answer = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    return answer
+
+# Example usage
+question = "what is mobile policy?"
+answer = generate_answer_without_context(question)
+print("Answer:", answer)
+
+#Generating answers with DPR contexts
+#Next, let's demonstrate how answers are generated when the model utilizes contexts retrieved via DPR, which are expected to enhance the answer's relevance and depth:
+
+def generate_answer(question, contexts):
+    # Concatenate the retrieved contexts to form the input to GPT2
+    input_text = question + ' ' + ' '.join(contexts)
+    inputs = tokenizer(input_text, return_tensors='pt', max_length=1024, truncation=True)
+
+    # Generate output using GPT2
+    summary_ids = model.generate(inputs['input_ids'], max_new_tokens=50, min_length=40, length_penalty=2.0,
+                                 num_beams=4, early_stopping=True,pad_token_id=tokenizer.eos_token_id)
+    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+question = "what is mobile policy?"
+
+_,I =search_relevant_contexts(question, question_tokenizer, question_encoder, index, k=5)
+
+print(f"paragraphs indexs {I}")
+
+#The top paragraphs from the query and context retrieval are show here:
+top_contexts = [paragraphs[idx] for idx in I[0]] 
+print(f"top_contexts {top_contexts}")
+
+#You can input the response from the model.
+# Assume `I[0]` contains indices of top contexts from the retrieval step
+answer = generate_answer(question, top_contexts)
+print("Generated Answer:", answer)
+
+#Observations and results
+#After experimenting with generating answers using GPT2 both directly and with the augmentation of DPR contexts, you can observe significant differences in the quality and relevance of the generated answers:
+
+#Direct generation:
+#Without DPR contexts, GPT2 relies solely on its pretrained knowledge to infer answers. This approach can sometimes lead to less precise or overly generic responses, as the model lacks specific information related to the query.
+#Generation with DPR contexts:
+#Incorporating DPR allows GPT2 to access specific information relevant to the query. This significantly enhances the accuracy and details of the generated answers, providing more informed and contextually appropriate responses.
+#The comparison clearly shows that integrating DPR retrieval with generative models such as GPT2 leads to more effective and contextually relevant answers. This demonstrates the effectiveness of combining retrieval and generation techniques in natural language processing applications, where the context provided by DPR can greatly improve the quality of the generated content.
+
+
+#PARAMETER TUNINNG
+def generate_answer(contexts, max_len=50, min_len=40, length_penalty=2.0, num_beams=4):
+    # Concatenate the retrieved contexts to form the input to BAR
+    input_text = ' '.join(contexts)
+    inputs = tokenizer(input_text, return_tensors='pt', max_length=1024, truncation=True)
+
+    # Generate output using GPT2
+    summary_ids = model.generate(
+        inputs['input_ids'],
+        max_new_tokens=max_len,
+        min_length=min_len,
+        length_penalty=length_penalty,
+        num_beams=num_beams,
+        early_stopping=True
+    )
+    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+# Define the question
+question = "what is mobile policy?"
+
+# Retrieve relevant contexts
+_, I = search_relevant_contexts(question, question_tokenizer, question_encoder, index, k=5)
+top_contexts = [paragraphs[idx] for idx in I[0]] 
+
+#PARAMETER TUNING
+
+#Experiment with different values for max_length, min_length, length_penalty, and num_beams.
+#Generate answers using at least three different sets of parameters.
+# Test different generation settings
+
+settings = [
+    (50, 50, 1.0, 2),
+    (120, 30, 2.0, 4),
+    (100, 20, 2.5, 6)
+]
+
+# Generate and print answers for each setting
+for setting in settings:
+    answer = generate_answer(top_contexts, *setting)
+    print(f"Settings: max_new_tokens={setting[0]}, min_length={setting[1]}, length_penalty={setting[2]}, num_beams={setting[3]}")
+    print("Generated Answer:", answer)
+    print("\n" + "="*80 + "\n")
